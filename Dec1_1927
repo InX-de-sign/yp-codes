@@ -70,7 +70,8 @@ public:
         streams[writeIndex].complete = false;
         streams[writeIndex].streamId = streamId;
         count++;
-        
+        writeIndex = (writeIndex + 1) % MAX_AUDIO_STREAMS;  
+
         Serial.printf("✅ Started stream %d (ID: %lu)\n", writeIndex, streamId);
         return true;
     }
@@ -95,10 +96,9 @@ public:
     void completeCurrentStream() {
         if (count == 0) return;
         
-        streams[writeIndex].complete = true;
-        Serial.printf("✅ Stream %d complete: %d bytes\n", writeIndex, streams[writeIndex].size);
-        
-        writeIndex = (writeIndex + 1) % MAX_AUDIO_STREAMS;
+        int prevIndex = (writeIndex - 1 + MAX_AUDIO_STREAMS) % MAX_AUDIO_STREAMS;
+        streams[prevIndex].complete = true;
+        Serial.printf("✅ Stream %d complete: %d bytes\n", prevIndex, streams[prevIndex].size);
     }
     
     // Get current stream for playback
