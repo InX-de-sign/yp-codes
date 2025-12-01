@@ -30,9 +30,9 @@ struct AudioStream {
 class AudioStreamQueue {
 private:
     AudioStream streams[MAX_AUDIO_STREAMS];
-    int readIndex = 0;
-    int writeIndex = 0;  // Points to where we're currently WRITING data
-    int nextStreamIndex = 0;  // Points to where NEXT stream will be allocated
+    int readIndex = 0;      // Points to the stream being played
+    int writeIndex = 0;     // Points to the stream currently receiving data
+    int nextStreamIndex = 0; // Points to where the NEXT stream will be allocated
     int count = 0;
 
 public:
@@ -93,29 +93,35 @@ public:
         Serial.printf("✅ Stream %d complete: %d bytes\n", writeIndex, streams[writeIndex].size);
     }
     
-        
-    // Get current stream for playback
     AudioStream* getCurrentPlaybackStream() {
         if (count == 0) return nullptr;
-        return &streams[playIndex];
+        return &streams[readIndex];  // ← Changed from playIndex to readIndex
     }
     
-    // Move to next stream for playback
     void advancePlayback() {
         if (count == 0) return;
         
         // Free the completed stream
-        if (streams[playIndex].data) {
-            heap_caps_free(streams[playIndex].data);
-            streams[playIndex].data = nullptr;
+        if (streams[readIndex].data) {  // ← Changed from playIndex to readIndex
+            heap_caps_free(streams[readIndex].data);
+            streams[readIndex].data = nullptr;
         }
-        streams[playIndex].size = 0;
-        streams[playIndex].complete = false;
+        streams[readIndex].size = 0;  // ← Changed from playIndex to readIndex
+        streams[readIndex].complete = false;
         
-        playIndex = (playIndex + 1) % MAX_AUDIO_STREAMS;
         count--;
+        readIndex = (readIndex + 1) % MAX_AUDIO_STREAMS;  // ← Changed from playIndex to readIndex
         
-        Serial.printf("Advanced to stream %d (%d remaining)\n", playIndex, count);
+        Serial.printf("Advanced to stream %d (%d remaining)\n", readIndex, count);
+    }
+    
+    int getCount() const {
+        return count;
+    }
+    
+    bool hasCompleteStream() {
+        if (count == 0) return false;
+        return streams[readIndex].complete;  // ← Changed from playIndex to readIndex
     }
     
     void clear() {
@@ -127,14 +133,11 @@ public:
             streams[i].size = 0;
             streams[i].complete = false;
         }
+        readIndex = 0;      // ← Changed from playIndex to readIndex
         writeIndex = 0;
-        playIndex = 0;
+        nextStreamIndex = 0;
         count = 0;
-        Serial.println("Queue cleared");
     }
-    
-    int getCount() { return count; }
-    bool hasStreams() { return count > 0; }
 };
 
 // Simple Circular Buffer for Audio Streaming
