@@ -648,23 +648,29 @@ void play_response_audio() {
         Serial.println("⏳ Waiting for stream data...");
         return;  // Exit early if stream not ready
     }
-    
-    // Skip
-    if (!headerSkipped && current->size < 100) {  // Need at least header + some audio
-        Serial.println("⏳ Buffering stream...");
-        return;
-    }
+
+    const size_t MIN_BUFFER_SIZE = 4096; 
 
     // Skip header on first call for this stream
     if (!headerSkipped) {
-        Serial.printf("🔊 Playing stream (size: %d bytes)\n", current->size);
+        // Wait for minimum buffer before starting
+        if (current->size < MIN_BUFFER_SIZE) {
+            // Don't spam logs - only show every 10th check
+            static int bufferWaitCount = 0;
+            if (++bufferWaitCount % 10 == 0) {
+                Serial.printf("⏳ Buffering: %d/%d bytes...\n", current->size, MIN_BUFFER_SIZE);
+            }
+            return;
+        }
+        
+        Serial.printf("📊 Playing stream (size: %d bytes)\n", current->size);
         digitalWrite(I2S_SD_SPK, HIGH);
         playbackOffset = 44;
         headerSkipped = true;
     }
 
     // Play one chunk
-    const size_t CHUNK_SIZE = 512;
+    const size_t CHUNK_SIZE = 1024;
     
     if (playbackOffset < current->size) {
         size_t remaining = current->size - playbackOffset;
@@ -682,22 +688,26 @@ void play_response_audio() {
         }
     } else {
         // This stream is finished - but only advance if it's marked complete!
-        if (current->complete) {  // ✅ ADD THIS CHECK
+        if (current->complete || audioQueue.getCount() > 1) {
+            // Either this stream is marked complete, OR there's another stream ready
             Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
             
             audioQueue.advancePlayback();
             playbackOffset = 44;
             headerSkipped = false;
             
+            // NO DELAY - immediately start next stream if available
             if (!audioQueue.hasStreams()) {
                 digitalWrite(I2S_SD_SPK, LOW);
                 isPlayingAudio = false;
                 waiting_for_response = false;
             }
         } else {
-            // Stream played but not marked complete yet - wait for more data or completion signal
-            Serial.println("⏳ Waiting for stream completion signal...");
-            return;
+            static unsigned long lastWaitLog = 0;
+            if (millis() - lastWaitLog > 100) {  // Log every 100ms max
+                Serial.println("⏳ Waiting for stream completion...");
+                lastWaitLog = millis();
+            }
         }
     }
 }
