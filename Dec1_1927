@@ -30,77 +30,70 @@ struct AudioStream {
 class AudioStreamQueue {
 private:
     AudioStream streams[MAX_AUDIO_STREAMS];
-    int writeIndex = 0;  // Where to write next stream
-    int playIndex = 0;   // Which stream is currently playing
+    int readIndex = 0;
+    int writeIndex = 0;  // Points to where we're currently WRITING data
+    int nextStreamIndex = 0;  // Points to where NEXT stream will be allocated
     int count = 0;
-    
+
 public:
-    AudioStreamQueue() {
-        for (int i = 0; i < MAX_AUDIO_STREAMS; i++) {
-            streams[i].data = nullptr;
-            streams[i].size = 0;
-            streams[i].capacity = 0;
-            streams[i].complete = false;
-            streams[i].streamId = 0;
-        }
-    }
-    
-    // Start a new stream
     bool startNewStream(unsigned long streamId) {
         if (count >= MAX_AUDIO_STREAMS) {
             Serial.println("⚠️ Queue full!");
             return false;
         }
         
-        // ✅ ADD THIS - Free old data if it exists (shouldn't happen, but safety first)
-        if (streams[writeIndex].data) {
-            heap_caps_free(streams[writeIndex].data);
-            streams[writeIndex].data = nullptr;
+        // Use nextStreamIndex for allocation
+        if (streams[nextStreamIndex].data) {
+            heap_caps_free(streams[nextStreamIndex].data);
+            streams[nextStreamIndex].data = nullptr;
         }
         
-        // Allocate buffer for new stream
-        streams[writeIndex].data = (uint8_t*)heap_caps_malloc(STREAM_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-        if (!streams[writeIndex].data) {
+        streams[nextStreamIndex].data = (uint8_t*)heap_caps_malloc(STREAM_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        if (!streams[nextStreamIndex].data) {
             Serial.println("❌ Stream allocation failed!");
             return false;
         }
         
-        streams[writeIndex].capacity = STREAM_BUFFER_SIZE;
-        streams[writeIndex].size = 0;
-        streams[writeIndex].complete = false;
-        streams[writeIndex].streamId = streamId;
+        streams[nextStreamIndex].capacity = STREAM_BUFFER_SIZE;
+        streams[nextStreamIndex].size = 0;
+        streams[nextStreamIndex].complete = false;
+        streams[nextStreamIndex].streamId = streamId;
+        
+        Serial.printf("✅ Started stream %d (ID: %lu)\n", nextStreamIndex, streamId);
+        
+        // Set writeIndex to the stream we just allocated
+        writeIndex = nextStreamIndex;
+        
         count++;
-        writeIndex = (writeIndex + 1) % MAX_AUDIO_STREAMS;  
-
-        Serial.printf("✅ Started stream %d (ID: %lu)\n", writeIndex, streamId);
+        nextStreamIndex = (nextStreamIndex + 1) % MAX_AUDIO_STREAMS;
+        
         return true;
     }
     
-    // Add data to current stream
-    bool addData(uint8_t* data, size_t length) {
-        if (count == 0 || writeIndex >= MAX_AUDIO_STREAMS) return false;
-        
-        AudioStream* current = &streams[writeIndex];
-        
-        if (current->size + length > current->capacity) {
-            Serial.printf("⚠️Stream %d buffer full!\n", writeIndex);
+    bool addData(const uint8_t* data, size_t len) {
+        if (count == 0 || !streams[writeIndex].data) {
             return false;
         }
         
-        memcpy(current->data + current->size, data, length);
-        current->size += length;
+        if (streams[writeIndex].size + len > streams[writeIndex].capacity) {
+            Serial.printf("⚠Stream %d buffer full!\n", writeIndex);
+            Serial.printf("⚠Failed to add %d bytes\n", len);
+            return false;
+        }
+        
+        memcpy(streams[writeIndex].data + streams[writeIndex].size, data, len);
+        streams[writeIndex].size += len;
         return true;
     }
     
-    // Mark current stream as complete, move to next
     void completeCurrentStream() {
         if (count == 0) return;
         
-        int prevIndex = (writeIndex - 1 + MAX_AUDIO_STREAMS) % MAX_AUDIO_STREAMS;
-        streams[prevIndex].complete = true;
-        Serial.printf("✅ Stream %d complete: %d bytes\n", prevIndex, streams[prevIndex].size);
+        streams[writeIndex].complete = true;
+        Serial.printf("✅ Stream %d complete: %d bytes\n", writeIndex, streams[writeIndex].size);
     }
     
+        
     // Get current stream for playback
     AudioStream* getCurrentPlaybackStream() {
         if (count == 0) return nullptr;
