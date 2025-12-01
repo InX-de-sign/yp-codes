@@ -438,7 +438,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             // Start a new stream
             streamCounter++;
             if (audioQueue.startNewStream(streamCounter)) {
-                Serial.printf("ðŸ"„ Stream %d started\n", streamCounter);
+                Serial.printf("Stream %d started\n", streamCounter);
             } else {
                 Serial.println("❌Failed to start stream - queue full");
             }
@@ -468,7 +468,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             if (audioQueue.addData(payload, length)) {
                 // Data added successfully
                 if (length > 4096) {  // Log large chunks
-                    Serial.printf("ðŸ"¦ Added %d bytes to stream\n", length);
+                    Serial.printf("Added %d bytes to stream\n", length);
                 }
             } else {
                 Serial.printf("⚠️Failed to add %d bytes\n", length);
