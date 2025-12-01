@@ -95,22 +95,22 @@ public:
     
     AudioStream* getCurrentPlaybackStream() {
         if (count == 0) return nullptr;
-        return &streams[readIndex];  // ← Changed from playIndex to readIndex
+        return &streams[readIndex];
     }
     
     void advancePlayback() {
         if (count == 0) return;
         
         // Free the completed stream
-        if (streams[readIndex].data) {  // ← Changed from playIndex to readIndex
+        if (streams[readIndex].data) {
             heap_caps_free(streams[readIndex].data);
             streams[readIndex].data = nullptr;
         }
-        streams[readIndex].size = 0;  // ← Changed from playIndex to readIndex
+        streams[readIndex].size = 0;
         streams[readIndex].complete = false;
         
         count--;
-        readIndex = (readIndex + 1) % MAX_AUDIO_STREAMS;  // ← Changed from playIndex to readIndex
+        readIndex = (readIndex + 1) % MAX_AUDIO_STREAMS;
         
         Serial.printf("Advanced to stream %d (%d remaining)\n", readIndex, count);
     }
@@ -121,7 +121,12 @@ public:
     
     bool hasCompleteStream() {
         if (count == 0) return false;
-        return streams[readIndex].complete;  // ← Changed from playIndex to readIndex
+        return streams[readIndex].complete;
+    }
+    
+    // ADD THIS METHOD - it's what your code is calling!
+    bool hasStreams() {
+        return count > 0;
     }
     
     void clear() {
@@ -133,7 +138,7 @@ public:
             streams[i].size = 0;
             streams[i].complete = false;
         }
-        readIndex = 0;      // ← Changed from playIndex to readIndex
+        readIndex = 0;
         writeIndex = 0;
         nextStreamIndex = 0;
         count = 0;
