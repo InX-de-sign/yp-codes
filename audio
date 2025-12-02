@@ -111,6 +111,33 @@ void RobotHead::moveN(int target) { moveSmooth(servoN, target, posN); }
 RobotHead head;
 
 // ==================== BATCH UPLOAD (4 IMAGES) ====================
+// Add this function before uploadBatchHTTP
+bool testServerConnection() {
+  Serial.println("\n🔍 Testing server connection...");
+  
+  WiFiClient client;
+  HTTPClient http;
+  
+  // Try a simple GET request to the health endpoint
+  String testUrl = "http://inx-fiona.tail4fb9a3.ts.net:5000/health";
+  http.begin(client, testUrl);
+  http.setTimeout(10000);  // 10 second timeout for test
+  
+  int httpCode = http.GET();
+  
+  if (httpCode > 0) {
+    Serial.printf("✅ Server reachable! Response: %d\n", httpCode);
+    String response = http.getString();
+    Serial.println("Response: " + response);
+    http.end();
+    return true;
+  } else {
+    Serial.printf("❌ Cannot reach server! Error: %d\n", httpCode);
+    http.end();
+    return false;
+  }
+}
+
 bool uploadBatchHTTP(PhotoInfo photos[], int count) {
   if (!wifi_connected) {
     Serial.println("⚠️ WiFi not connected - skipping upload");
@@ -123,7 +150,7 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
   
   HTTPClient http;
   http.begin(client, UPLOAD_URL);
-  http.setTimeout(60000);  // 60 second timeout for batch
+  http.setTimeout(120000);  // 60 second timeout for batch
 
   // Build multipart form data with multiple files
   String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
@@ -236,6 +263,7 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
   }
 }
 
+
 // ===================== Helper: Take & Save Photo =====================
 void takePhoto(int number, const char* position_name) {
   Serial.printf("📷 Taking photo %d/4 [%s]...\n", number, position_name);
@@ -296,7 +324,7 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_SVGA;
   config.jpeg_quality = 10;
   config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
@@ -533,19 +561,24 @@ void capture() {
 
   // Now upload all 4 images in one batch
   Serial.println("\n" + String('=').substring(0, 50));
+
   if (wifi_connected) {
-    bool success = uploadBatchHTTP(photos, 4);
-    if (success) {
-      photo_counter += 4;
-      Serial.println("✅ All 4 images uploaded successfully!");
-      
-      // Optional: Delete all 4 files after successful upload
-      // for (int i = 0; i < 4; i++) {
-      //   SD_MMC.remove(photos[i].filename);
-      //   Serial.printf("🗑️  Deleted: %s\n", photos[i].filename.c_str());
-      // }
+    if (testServerConnection()) {
+      bool success = uploadBatchHTTP(photos, 4);
+      if (success) {
+        photo_counter += 4;
+        Serial.println("✅ All 4 images uploaded successfully!");
+        
+        // Optional: Delete all 4 files after successful upload
+        // for (int i = 0; i < 4; i++) {
+        //   SD_MMC.remove(photos[i].filename);
+        //   Serial.printf("🗑️  Deleted: %s\n", photos[i].filename.c_str());
+        // }
+      } else {
+        Serial.println("❌ Batch upload failed - images remain on SD card");
+      }
     } else {
-      Serial.println("❌ Batch upload failed - images remain on SD card");
+      Serial.println("❌ Server unreachable - skipping upload");
     }
   } else {
     Serial.println("⚠️ WiFi not connected - 4 photos saved to SD only");
