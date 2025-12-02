@@ -16,7 +16,7 @@ const char* password = "12345678";
 
 // ==================== SERVER CONFIGURATION ====================
 const char* SERVER_HOST = "inx-fiona.tail4fb9a3.ts.net";
-const char* UPLOAD_URL = "https://inx-fiona.tail4fb9a3.ts.net/vision/upload_batch";  // New batch endpoint
+const char* UPLOAD_URL = "https://inx-fiona.tail4fb9a3.ts.net/upload_batch";
 const char* CLIENT_ID = "esp32_robot_camera";
 
 // ==================== CAMERA PINS (GOOUUU ESP32-S3-CAM) ====================
