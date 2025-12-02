@@ -1,5 +1,6 @@
 /*********************************************************************
   ESP32-S3-CAM + Robot Head - Batch SD Card Upload (4 images at once)
+  HTTPS Upload with WiFiClientSecure
 *********************************************************************/
 
 #include "esp_camera.h"
@@ -16,7 +17,7 @@ const char* password = "12345678";
 
 // ==================== SERVER CONFIGURATION ====================
 const char* SERVER_HOST = "inx-fiona.tail4fb9a3.ts.net";
-const char* UPLOAD_URL = "http://inx-fiona.tail4fb9a3.ts.net:5000/upload_batch";
+const char* UPLOAD_URL = "https://inx-fiona.tail4fb9a3.ts.net/upload_batch";  // HTTPS!
 const char* CLIENT_ID = "esp32_robot_camera";
 
 // ==================== CAMERA PINS (GOOUUU ESP32-S3-CAM) ====================
@@ -110,34 +111,51 @@ void RobotHead::moveN(int target) { moveSmooth(servoN, target, posN); }
 
 RobotHead head;
 
-// ==================== BATCH UPLOAD (4 IMAGES) ====================
-// Add this function before uploadBatchHTTP
+// ==================== SERVER CONNECTION TEST ====================
 bool testServerConnection() {
   Serial.println("\n🔍 Testing server connection...");
   
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip SSL verification
+  
   HTTPClient http;
   
-  // Try a simple GET request to the health endpoint
-  String testUrl = "http://inx-fiona.tail4fb9a3.ts.net:5000/health";
-  http.begin(client, testUrl);
-  http.setTimeout(10000);  // 10 second timeout for test
+  // Try to reach the upload endpoint
+  http.begin(client, UPLOAD_URL);
+  http.setTimeout(10000);  // 10 second timeout
+  
+  // Just do a HEAD/GET request to check connectivity
+  http.addHeader("X-Client-ID", CLIENT_ID);
   
   int httpCode = http.GET();
   
   if (httpCode > 0) {
     Serial.printf("✅ Server reachable! Response: %d\n", httpCode);
     String response = http.getString();
-    Serial.println("Response: " + response);
+    if (response.length() > 0 && response.length() < 200) {
+      Serial.println("Response: " + response);
+    }
     http.end();
     return true;
   } else {
     Serial.printf("❌ Cannot reach server! Error: %d\n", httpCode);
+    
+    // Print specific error details
+    switch(httpCode) {
+      case -1: Serial.println("   → Connection lost/timeout"); break;
+      case -2: Serial.println("   → Failed to connect"); break;
+      case -3: Serial.println("   → Connection refused"); break;
+      case -4: Serial.println("   → Connection lost"); break;
+      case -11: Serial.println("   → Timeout"); break;
+      default: Serial.println("   → Unknown error"); break;
+    }
+    
     http.end();
     return false;
   }
 }
 
+// ==================== BATCH UPLOAD (4 IMAGES) ====================
 bool uploadBatchHTTP(PhotoInfo photos[], int count) {
   if (!wifi_connected) {
     Serial.println("⚠️ WiFi not connected - skipping upload");
@@ -146,11 +164,13 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
 
   Serial.printf("\n📦 Starting BATCH upload of %d images...\n", count);
 
-  WiFiClient client;  
+  // Use WiFiClientSecure (same as working code)
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip SSL certificate verification
   
   HTTPClient http;
   http.begin(client, UPLOAD_URL);
-  http.setTimeout(120000);  // 60 second timeout for batch
+  http.setTimeout(120000);  // 2 minute timeout for batch
 
   // Build multipart form data with multiple files
   String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
@@ -172,7 +192,6 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
   }
 
   // Add space for multipart boundaries and headers
-  // Rough estimate: ~200 bytes per file boundary + metadata
   totalSize += (count * 300) + 100;
 
   Serial.printf("📊 Total batch size: ~%u KB\n", totalSize / 1024);
@@ -196,7 +215,7 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
       return false;
     }
 
-    // Build part header
+    // Build part header (matching working code style)
     String partHeader = "--" + boundary + "\r\n";
     partHeader += "Content-Disposition: form-data; name=\"file" + String(i) + "\"; filename=\"";
     partHeader += photos[i].position + "_" + String(photos[i].number) + ".jpg\"\r\n";
@@ -231,38 +250,67 @@ bool uploadBatchHTTP(PhotoInfo photos[], int count) {
 
   Serial.printf("📤 Assembled payload: %u bytes\n", offset);
 
-  // Set headers
+  // Set headers (matching working code)
   http.addHeader("Content-Type", contentType);
   http.addHeader("X-Client-ID", CLIENT_ID);
   http.addHeader("X-Batch-Size", String(count));
   http.addHeader("X-Timestamp", String(millis()));
 
+  // Debug output
+  Serial.println("\n📋 Request Details:");
+  Serial.printf("  URL: %s\n", UPLOAD_URL);
+  Serial.printf("  Method: POST\n");
+  Serial.printf("  Content-Type: %s\n", contentType.c_str());
+  Serial.printf("  Payload size: %u bytes\n", offset);
+
   // Send POST request
-  Serial.println("📡 Uploading batch...");
+  Serial.println("\n📡 Uploading batch...");
+  unsigned long startTime = millis();
+  
   int httpResponseCode = http.POST(payload, offset);
+  
+  unsigned long duration = millis() - startTime;
+  Serial.printf("⏱️  Upload took: %lu ms\n", duration);
   
   free(payload);
 
   // Handle response
-  if (httpResponseCode == 200 || httpResponseCode == 201) {
-    Serial.printf("✅ Batch upload successful! Response: %d\n", httpResponseCode);
-    String response = http.getString();
-    if (response.length() > 0 && response.length() < 1000) {
-      Serial.println("Server response: " + response);
+  if (httpResponseCode > 0) {
+    if (httpResponseCode == 200 || httpResponseCode == 201) {
+      Serial.printf("✅ Batch upload successful! Response: %d\n", httpResponseCode);
+      String response = http.getString();
+      if (response.length() > 0 && response.length() < 1000) {
+        Serial.println("Server response: " + response);
+      }
+      http.end();
+      return true;
+    } else {
+      Serial.printf("❌ Server returned error: %d\n", httpResponseCode);
+      String response = http.getString();
+      if (response.length() > 0 && response.length() < 500) {
+        Serial.println("Error details: " + response);
+      }
+      http.end();
+      return false;
     }
-    http.end();
-    return true;
   } else {
-    Serial.printf("❌ Batch upload failed! Response: %d\n", httpResponseCode);
-    String response = http.getString();
-    if (response.length() > 0 && response.length() < 500) {
-      Serial.println("Error: " + response);
+    // Negative response = connection error
+    Serial.printf("❌ Connection error: %d\n", httpResponseCode);
+    
+    // Print specific error
+    switch(httpResponseCode) {
+      case -1: Serial.println("   → Connection lost/timeout during upload"); break;
+      case -2: Serial.println("   → Failed to connect to server"); break;
+      case -3: Serial.println("   → Connection refused"); break;
+      case -4: Serial.println("   → Connection lost"); break;
+      case -11: Serial.println("   → Timeout"); break;
+      default: Serial.println("   → Unknown error"); break;
     }
+    
     http.end();
     return false;
   }
 }
-
 
 // ===================== Helper: Take & Save Photo =====================
 void takePhoto(int number, const char* position_name) {
@@ -300,7 +348,7 @@ void capture();
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
-  Serial.println("\n=== ESP32-S3-CAM + Robot Head + BATCH Upload ===");
+  Serial.println("\n=== ESP32-S3-CAM + Robot Head + BATCH Upload (HTTPS) ===");
 
   // Camera initialization
   camera_config_t config;
@@ -324,8 +372,8 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_SVGA;
-  config.jpeg_quality = 10;
+  config.frame_size = FRAMESIZE_SVGA;  // 800x600 for smaller file size
+  config.jpeg_quality = 15;  // Slightly lower quality
   config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -395,7 +443,7 @@ void setup() {
       html += "h1{color:#333;} a{color:#0066cc;text-decoration:none;font-size:18px;}</style></head>";
       html += "<body><h1>🤖 ESP32 Robot Camera</h1>";
       html += "<p>Status: <strong style='color:green'>Online</strong></p>";
-      html += "<p>Mode: <strong>BATCH Upload (4 images at once)</strong></p>";
+      html += "<p>Mode: <strong>BATCH Upload (4 images via HTTPS)</strong></p>";
       html += "<p>📸 <a href='/list'>View Photo Gallery</a></p>";
       html += "</body></html>";
       server.send(200, "text/html", html);
@@ -463,7 +511,7 @@ void setup() {
   Serial.println("\n========================================");
   Serial.println("✅ SYSTEM READY");
   Serial.println("========================================");
-  Serial.println("Mode: BATCH Upload (4 images → 1 request)");
+  Serial.println("Mode: BATCH Upload via HTTPS (4 images → 1 request)");
   Serial.println("Press button (GPIO 45) to start capture");
   Serial.println("========================================\n");
 
@@ -560,7 +608,7 @@ void capture() {
   head.moveN(45);
 
   // Now upload all 4 images in one batch
-  Serial.println("\n" + String('=').substring(0, 50));
+  Serial.println("\n==================================================");
 
   if (wifi_connected) {
     if (testServerConnection()) {
