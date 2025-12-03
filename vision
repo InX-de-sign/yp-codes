@@ -1,5 +1,6 @@
 /*********************************************************************
-  ESP32-S3-CAM + Robot Head - HTTP Post upload + Web Server
+  ESP32-S3-CAM + Robot Head - Batch SD Card Upload (4 images at once)
+  HTTPS Upload with WiFiClientSecure
 *********************************************************************/
 
 #include "esp_camera.h"
@@ -11,12 +12,12 @@
 #include <WebServer.h>
 
 // ==================== WIFI CONFIGURATION ====================
-const char* ssid = "ISDN300C";
-const char* password = "12345678";
+const char* ssid = "ISD-Project-22Fall";
+const char* password = "isd@2022Fall";
 
 // ==================== SERVER CONFIGURATION ====================
 const char* SERVER_HOST = "inx-fiona.tail4fb9a3.ts.net";
-const char* UPLOAD_URL = "https://inx-fiona.tail4fb9a3.ts.net/vision/upload";
+const char* UPLOAD_URL = "https://inx-fiona.tail4fb9a3.ts.net/vision/upload_batch";  // HTTPS!
 const char* CLIENT_ID = "esp32_robot_camera";
 
 // ==================== CAMERA PINS (GOOUUU ESP32-S3-CAM) ====================
@@ -44,7 +45,7 @@ const uint8_t SERVO_HORIZONTAL = 21;
 const uint8_t SERVO_NOD        = 20;
 const uint8_t BUTTON_PIN       = 45;
 
-const int STEP_DELAY   = 30;
+const int STEP_DELAY   = 15;   // Reduced from 30ms to 5ms (6x faster!)
 const int HOLD_TIME    = 2000;
 
 // ===================== GLOBAL OBJECTS =====================
@@ -52,8 +53,18 @@ int photo_counter = 1;
 bool wifi_connected = false;
 bool is_capturing = false;
 
-// ✅ FIXED: Declare server globally
+// Timing for automatic capture every 15 seconds
+unsigned long lastCaptureTime = 0;
+const unsigned long CAPTURE_INTERVAL = 15000; // 15 seconds
+
 WebServer server(80);
+
+// Structure to hold photo info for batch upload
+struct PhotoInfo {
+  String filename;
+  String position;
+  int number;
+};
 
 // ===================== RobotHead Class =====================
 class RobotHead {
@@ -104,103 +115,203 @@ void RobotHead::moveN(int target) { moveSmooth(servoN, target, posN); }
 
 RobotHead head;
 
-// ==================== HTTP UPLOAD FUNCTION ====================
-bool uploadImageHTTP(const char* position_name, int photo_number) {
-  if (!wifi_connected) {
-    Serial.println("Warning: WiFi not connected - skipping upload");
-    return false;
-  }
-
-  // Build the exact same filename that was used in takePhoto()
-  char filename[64];
-  snprintf(filename, sizeof(filename), "/robot_pos%d_%s.jpg", photo_number, position_name);
-
-  File file = SD_MMC.open(filename, FILE_READ);
-  if (!file) {
-    Serial.printf("Error: Cannot open file for upload: %s\n", filename);
-    return false;
-  }
-
-  size_t fileSize = file.size();
-  if (fileSize == 0) {
-    Serial.println("Error: File is empty!");
-    file.close();
-    return false;
-  }
-
-  Serial.printf("Uploading from SD: %s (%u KB)\n", filename, fileSize / 1024);
-
+// ==================== SERVER CONNECTION TEST ====================
+bool testServerConnection() {
+  Serial.println("\n🔍 Testing server connection...");
+ 
   WiFiClientSecure client;
-  client.setInsecure();  // Only for HTTPS servers with self-signed certs
-
+  client.setInsecure();  // Skip SSL verification
+ 
   HTTPClient http;
+ 
+  // Try to reach the upload endpoint
   http.begin(client, UPLOAD_URL);
-  http.setTimeout(45000);  // Longer timeout for big files / slow connection
-
-  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-  String contentType = "multipart/form-data; boundary=" + boundary;
-
-  String head = "--" + boundary + "\r\n";
-  head += "Content-Disposition: form-data; name=\"file\"; filename=\"image.jpg\"\r\n";
-  head += "Content-Type: image/jpeg\r\n\r\n";
-
-  String tail = "\r\n--" + boundary + "--\r\n";
-
-  // We stream directly from SD card → no need to load entire file into RAM!
-  http.addHeader("Content-Type", contentType);
+  http.setTimeout(10000);  // 10 second timeout
+ 
+  // Just do a HEAD/GET request to check connectivity
   http.addHeader("X-Client-ID", CLIENT_ID);
-  http.addHeader("X-Position", position_name);
-  http.addHeader("X-Photo-Number", String(photo_number));
-  http.addHeader("X-Timestamp", String(millis()));
-
-  // Start the multipart POST
-  bool success = http.sendRequest("POST", (uint8_t*)head.c_str(), head.length());
-
-  if (!success) {
-    Serial.println("Error: Failed to send multipart header");
-    file.close();
+ 
+  int httpCode = http.GET();
+ 
+  if (httpCode > 0) {
+    Serial.printf("✅ Server reachable! Response: %d\n", httpCode);
+    String response = http.getString();
+    if (response.length() > 0 && response.length() < 200) {
+      Serial.println("Response: " + response);
+    }
+    http.end();
+    return true;
+  } else {
+    Serial.printf("❌ Cannot reach server! Error: %d\n", httpCode);
+   
+    // Print specific error details
+    switch(httpCode) {
+      case -1: Serial.println("   → Connection lost/timeout"); break;
+      case -2: Serial.println("   → Failed to connect"); break;
+      case -3: Serial.println("   → Connection refused"); break;
+      case -4: Serial.println("   → Connection lost"); break;
+      case -11: Serial.println("   → Timeout"); break;
+      default: Serial.println("   → Unknown error"); break;
+    }
+   
     http.end();
     return false;
   }
+}
 
-  // Stream the file in chunks (no full RAM load!)
-  size_t bytesSent = 0;
-  uint8_t buf[1024];
-  while (file.available()) {
-    size_t len = file.read(buf, sizeof(buf));
-    if (http.sendRequest("POST", buf, len) != len) {
-      Serial.println("Error: Failed to send file chunk");
-      success = false;
-      break;
-    }
-    bytesSent += len;
-    // Optional: show progress
-    if (bytesSent % (20 * 1024) == 0) {
-      Serial.printf("   ...sent %u KB\n", bytesSent / 1024);
-    }
+// ==================== BATCH UPLOAD (2 IMAGES) ====================
+bool uploadBatchHTTP(PhotoInfo photos[], int count) {
+  if (!wifi_connected) {
+    Serial.println("⚠️ WiFi not connected - skipping upload");
+    return false;
   }
 
-  // Send the closing boundary
-  if (success) {
-    http.sendRequest("POST", (uint8_t*)tail.c_str(), tail.length());
+  Serial.printf("\n📦 Starting BATCH upload of %d images...\n", count);
+
+  // Use WiFiClientSecure (same as working code)
+  WiFiClientSecure client;
+  client.setInsecure();  // Skip SSL certificate verification
+ 
+  HTTPClient http;
+  http.begin(client, UPLOAD_URL);
+  http.setTimeout(120000);  // 2 minute timeout for batch
+
+  // Build multipart form data with multiple files
+  String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+  String contentType = "multipart/form-data; boundary=" + boundary;
+
+  // Calculate total size first
+  size_t totalSize = 0;
+  size_t fileSizes[4] = {0};
+ 
+  for (int i = 0; i < count; i++) {
+    File file = SD_MMC.open(photos[i].filename, FILE_READ);
+    if (!file) {
+      Serial.printf("❌ Failed to open: %s\n", photos[i].filename.c_str());
+      return false;
+    }
+    fileSizes[i] = file.size();
+    totalSize += fileSizes[i];
+    file.close();
   }
 
-  int httpResponseCode = http.getResponseCode();
+  // Add space for multipart boundaries and headers
+  totalSize += (count * 300) + 100;
 
-  file.close();
-  http.end();
+  Serial.printf("📊 Total batch size: ~%u KB\n", totalSize / 1024);
 
-  if (httpResponseCode == 200 || httpResponseCode == 201) {
-    Serial.printf("Upload successful! (%s) Code: %d\n", filename, httpResponseCode);
-    String response = http.getString();
-    if (response.length() > 0 && response.length() < 500) {
-      Serial.println("Server: " + response);
+  // Allocate buffer for entire payload
+  uint8_t* payload = (uint8_t*)malloc(totalSize);
+  if (!payload) {
+    Serial.println("❌ Failed to allocate memory for batch!");
+    return false;
+  }
+
+  // Build the multipart payload
+  size_t offset = 0;
+
+  for (int i = 0; i < count; i++) {
+    // Open file
+    File file = SD_MMC.open(photos[i].filename, FILE_READ);
+    if (!file) {
+      Serial.printf("❌ Failed to open: %s\n", photos[i].filename.c_str());
+      free(payload);
+      return false;
     }
-    return true;
+
+    // Build part header (matching working code style)
+    String partHeader = "--" + boundary + "\r\n";
+    partHeader += "Content-Disposition: form-data; name=\"file" + String(i+1) + "\"; filename=\"";
+    partHeader += photos[i].position + "_" + String(photos[i].number) + ".jpg\"\r\n";
+    partHeader += "Content-Type: image/jpeg\r\n\r\n";
+
+    // Copy header to payload
+    memcpy(payload + offset, partHeader.c_str(), partHeader.length());
+    offset += partHeader.length();
+
+    // Read and copy file data
+    size_t bytesRead = file.read(payload + offset, fileSizes[i]);
+    if (bytesRead != fileSizes[i]) {
+      Serial.printf("❌ Read error for %s\n", photos[i].filename.c_str());
+      file.close();
+      free(payload);
+      return false;
+    }
+    offset += bytesRead;
+    file.close();
+
+    // Add CRLF after file data
+    memcpy(payload + offset, "\r\n", 2);
+    offset += 2;
+
+    Serial.printf("  ✓ Added %s (%u KB)\n", photos[i].position.c_str(), fileSizes[i] / 1024);
+  }
+
+  // Add closing boundary
+  String closingBoundary = "--" + boundary + "--\r\n";
+  memcpy(payload + offset, closingBoundary.c_str(), closingBoundary.length());
+  offset += closingBoundary.length();
+
+  Serial.printf("📤 Assembled payload: %u bytes\n", offset);
+
+  // Set headers (matching working code)
+  http.addHeader("Content-Type", contentType);
+  http.addHeader("X-Client-ID", CLIENT_ID);
+  http.addHeader("X-Batch-Size", String(count));
+  http.addHeader("X-Timestamp", String(millis()));
+
+  // Debug output
+  Serial.println("\n📋 Request Details:");
+  Serial.printf("  URL: %s\n", UPLOAD_URL);
+  Serial.printf("  Method: POST\n");
+  Serial.printf("  Content-Type: %s\n", contentType.c_str());
+  Serial.printf("  Payload size: %u bytes\n", offset);
+
+  // Send POST request
+  Serial.println("\n📡 Uploading batch...");
+  unsigned long startTime = millis();
+ 
+  int httpResponseCode = http.POST(payload, offset);
+ 
+  unsigned long duration = millis() - startTime;
+  Serial.printf("⏱️  Upload took: %lu ms\n", duration);
+ 
+  free(payload);
+
+  // Handle response
+  if (httpResponseCode > 0) {
+    if (httpResponseCode == 200 || httpResponseCode == 201) {
+      Serial.printf("✅ Batch upload successful! Response: %d\n", httpResponseCode);
+      String response = http.getString();
+      if (response.length() > 0 && response.length() < 1000) {
+        Serial.println("Server response: " + response);
+      }
+      http.end();
+      return true;
+    } else {
+      Serial.printf("❌ Server returned error: %d\n", httpResponseCode);
+      String response = http.getString();
+      if (response.length() > 0 && response.length() < 500) {
+        Serial.println("Error details: " + response);
+      }
+      http.end();
+      return false;
+    }
   } else {
-    Serial.printf("Upload failed! Code: %d\n", httpResponseCode);
-    String response = http.getString();
-    if (response.length() > 0) Serial.println("Error: " + response);
+    // Negative response = connection error
+    Serial.printf("❌ Connection error: %d\n", httpResponseCode);
+   
+    // Print specific error
+    switch(httpResponseCode) {
+      case -1: Serial.println("   → Connection lost/timeout during upload"); break;
+      case -2: Serial.println("   → Failed to connect to server"); break;
+      case -3: Serial.println("   → Connection refused"); break;
+      case -4: Serial.println("   → Connection lost"); break;
+      case -11: Serial.println("   → Timeout"); break;
+      default: Serial.println("   → Unknown error"); break;
+    }
+   
+    http.end();
     return false;
   }
 }
@@ -217,28 +328,22 @@ void takePhoto(int number, const char* position_name) {
 
   Serial.printf("✓ Captured: %dx%d | %u bytes\n", fb->width, fb->height, fb->len);
 
+  // Save to SD card
   char filename[64];
   snprintf(filename, sizeof(filename), "/robot_pos%d_%s.jpg", number, position_name);
 
   File file = SD_MMC.open(filename, FILE_WRITE);
   if (!file) {
     Serial.println("❌ SD card write failed!");
-  } else {
-    file.write(fb->buf, fb->len);
-    file.close();
-    Serial.printf("💾 Saved to SD: %s\n", filename);
+    esp_camera_fb_return(fb);
+    return;
   }
  
-  if (wifi_connected) {
-    bool success = uploadImageHTTP(position_name, number);  // note: parameters swapped
-    if (success) {
-      photo_counter++;
-      // Optional: delete file after successful upload to save space
-      // SD_MMC.remove(filename);
-    }
-  } else {
-    Serial.println("Warning: WiFi not connected - photo saved to SD only");
-  }
+  file.write(fb->buf, fb->len);
+  file.close();
+  Serial.printf("💾 Saved to SD: %s\n", filename);
+ 
+  esp_camera_fb_return(fb);
 }
 
 void capture();
@@ -247,9 +352,9 @@ void capture();
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
-  Serial.println("\n=== ESP32-S3-CAM + Robot Head + Web Server ===");
+  Serial.println("\n=== ESP32-S3-CAM + Robot Head + BATCH Upload (HTTPS) ===");
 
-  // Camera
+  // Camera initialization
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -271,8 +376,8 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_UXGA;
-  config.jpeg_quality = 10;
+  config.frame_size = FRAMESIZE_SVGA;  // 800x600 for smaller file size
+  config.jpeg_quality = 8;  // Slightly lower quality
   config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -282,32 +387,36 @@ void setup() {
     while (1) delay(1000);
   }
   Serial.println("✅ Camera OK");
+  Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());
+  Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
 
   sensor_t *s = esp_camera_sensor_get();
   s->set_brightness(s, 1);
   s->set_contrast(s, 1);
   s->set_whitebal(s, 1);
 
-  // SD Card
+  // SD Card initialization
   SD_MMC.setPins(39, 38, 40);
   if (!SD_MMC.begin("/sdcard", true)) {
     Serial.println("❌ SD Card mount failed!");
     while (1) delay(1000);
   }
-  Serial.println("✅ SD Card OK");
+ 
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+  Serial.printf("✅ SD Card OK (%llu MB)\n", cardSize);
 
-  // Servos
+  // Servos initialization
   Serial.println("Initializing servos...");
   head.setupPins(SERVO_HORIZONTAL, SERVO_NOD, BUTTON_PIN);
   head.begin();
   delay(1000);
   Serial.println("✅ Servos ready");
 
-  // Button
+  // Button setup
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   Serial.println("✅ Button setup complete (GPIO 45, active LOW)");
 
-  // WiFi
+  // WiFi connection
   Serial.println("\n========================================");
   Serial.println("📡 WIFI CONNECTION");
   Serial.println("========================================");
@@ -332,43 +441,56 @@ void setup() {
     Serial.printf("   Signal: %d dBm\n", WiFi.RSSI());
     Serial.printf("   Upload URL: %s\n", UPLOAD_URL);
    
-    // ✅ Setup web server routes
+    // Setup web server routes
     server.on("/", HTTP_GET, []() {
-      String html = "<html><head><title>ESP32 Camera</title></head>";
-      html += "<body><h1>ESP32 Robot Camera</h1>";
-      html += "<p><a href='/list'>View Photos</a></p>";
+      String html = "<html><head><title>ESP32 Camera</title>";
+      html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+      html += "<style>body{font-family:Arial;padding:20px;background:#f0f0f0;} ";
+      html += "h1{color:#333;} a{color:#0066cc;text-decoration:none;font-size:18px;}</style></head>";
+      html += "<body><h1>🤖 ESP32 Robot Camera</h1>";
+      html += "<p>Status: <strong style='color:green'>Online</strong></p>";
+      html += "<p>Mode: <strong>AUTO Capture every 15s (2 images via HTTPS)</strong></p>";
+      html += "<p>📸 <a href='/list'>View Photo Gallery</a></p>";
       html += "</body></html>";
       server.send(200, "text/html", html);
     });
    
     server.on("/list", HTTP_GET, []() {
       String html = "<html><head><title>Photo Gallery</title>";
-      html += "<style>body{font-family:Arial;padding:20px;} ";
-      html += "ul{list-style:none;} li{margin:10px;} ";
-      html += "a{text-decoration:none;color:#0066cc;font-size:18px;}</style></head>";
-      html += "<body><h1>📸 SD Card Photos</h1><ul>";
+      html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+      html += "<style>body{font-family:Arial;padding:20px;background:#f0f0f0;} ";
+      html += "ul{list-style:none;padding:0;} li{margin:10px;background:white;padding:10px;border-radius:5px;} ";
+      html += "a{text-decoration:none;color:#0066cc;font-size:16px;}</style></head>";
+      html += "<body><h1>📸 SD Card Photo Gallery</h1><ul>";
      
       File root = SD_MMC.open("/");
       File file = root.openNextFile();
+      int photoCount = 0;
      
       while(file) {
         if (!file.isDirectory()) {
           String filename = String(file.name());
           if (filename.endsWith(".jpg")) {
-            html += "<li>📷 <a href='/photo?file=" + filename + "'>" + filename + "</a></li>";
+            html += "<li>📷 <a href='/photo?file=" + filename + "'>" + filename + "</a>";
+            html += " (" + String(file.size() / 1024) + " KB)</li>";
+            photoCount++;
           }
         }
         file = root.openNextFile();
       }
      
-      html += "</ul><p><a href='/'>← Back</a></p></body></html>";
+      if (photoCount == 0) {
+        html += "<li>No photos found on SD card</li>";
+      }
+     
+      html += "</ul><p><a href='/'>← Back to Home</a></p></body></html>";
       server.send(200, "text/html", html);
     });
    
     server.on("/photo", HTTP_GET, []() {
       String filename = server.arg("file");
      
-      if (filename.indexOf("..") >= 0) {  // Security check
+      if (filename.indexOf("..") >= 0) {
         server.send(400, "text/plain", "Invalid filename");
         return;
       }
@@ -395,88 +517,87 @@ void setup() {
   Serial.println("\n========================================");
   Serial.println("✅ SYSTEM READY");
   Serial.println("========================================");
-  Serial.println("Method: HTTP POST upload + Web Server");
-  Serial.println("Press button (GPIO 45) to start");
+  Serial.println("Mode: AUTO Capture every 15 seconds (2 images → 1 request)");
+  Serial.println("Automatic capture will start in 15 seconds...");
   Serial.println("========================================\n");
 
   delay(1000);
  
-  // Test button
-  Serial.println("🔍 Testing button...");
-  for (int i = 0; i < 10; i++) {
-    int buttonState = digitalRead(BUTTON_PIN);
-    Serial.printf("Button state: %s\n", buttonState == HIGH ? "HIGH (not pressed)" : "LOW (pressed)");
-    delay(100);
-  }
-  Serial.println("Button test complete. Ready for input.\n");
+  // Initialize capture timer
+  lastCaptureTime = millis();
+  Serial.println("Timer initialized. Automatic capture mode active.\n");
 }
- 
+
 void loop() {
-  // Button debouncing
-  static bool lastStableState = HIGH;
-  static bool lastReading = HIGH;
-  static unsigned long lastDebounceTime = 0;
-  const unsigned long debounceDelay = 50;
+  // Check if it's time for automatic capture
+  unsigned long currentTime = millis();
  
-  bool currentReading = digitalRead(BUTTON_PIN);
- 
-  if (currentReading != lastReading) {
-    lastDebounceTime = millis();
-    lastReading = currentReading;
+  if (currentTime - lastCaptureTime >= CAPTURE_INTERVAL && !is_capturing) {
+    Serial.printf("\n⏰ Auto-capture triggered (every %d seconds)\n", CAPTURE_INTERVAL / 1000);
+    is_capturing = true;
+    capture();
+    is_capturing = false;
+    lastCaptureTime = currentTime;
   }
  
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (currentReading != lastStableState) {
-      lastStableState = currentReading;
-     
-      if (currentReading == LOW && !is_capturing) {
-        Serial.println("\n🔘 BUTTON PRESSED!");
-        is_capturing = true;
-        capture();
-        is_capturing = false;
-       
-        while (digitalRead(BUTTON_PIN) == LOW) {
-          delay(10);
-        }
-        Serial.println("🔘 Button released, ready for next press\n");
-      }
-    }
-  }
- 
-  // ✅ Handle web server requests
+  // Handle web server requests
   if (wifi_connected) {
     server.handleClient();
   }
  
-  delay(10);
+  delay(100); // Small delay to prevent excessive CPU usage
 }
 
 void capture() {
-  Serial.println("\n🎬 Starting 4-photo sequence...\n");
+  Serial.println("\n🎬 Starting 2-photo sequence...\n");
 
+  // Array to store photo information
+  PhotoInfo photos[2];
+
+  // Position 1: Left + Down
   Serial.println("📍 Position 1: left-down");
-  head.moveH(0);  head.moveN(0);
+  head.moveH(25);
+  head.moveN(25);
   delay(HOLD_TIME);
   takePhoto(1, "left-down");
+  photos[0] = {"/robot_pos1_left-down.jpg", "left-down", photo_counter};
 
+  // Position 2: Right + Down
   Serial.println("📍 Position 2: right-down");
-  head.moveH(90);
+  head.moveH(65);
   delay(HOLD_TIME);
   takePhoto(2, "right-down");
+  photos[1] = {"/robot_pos2_right-down.jpg", "right-down", photo_counter + 1};
 
-  Serial.println("📍 Position 3: right-up");
-  head.moveN(90);
-  delay(HOLD_TIME);
-  takePhoto(3, "right-up");
-
-  Serial.println("📍 Position 4: left-up");
-  head.moveH(0);
-  delay(HOLD_TIME);
-  takePhoto(4, "left-up");
-
+  // Return to center
   Serial.println("\n🎯 Returning to center...");
   head.moveH(45);
   head.moveN(45);
+
+  // Now upload both images in one batch
+  Serial.println("\n==================================================");
+
+  if (wifi_connected) {
+    if (testServerConnection()) {
+      bool success = uploadBatchHTTP(photos, 2);
+      if (success) {
+        photo_counter += 2;
+        Serial.println("✅ Both images uploaded successfully!");
+       
+        // Optional: Delete both files after successful upload
+        // for (int i = 0; i < 2; i++) {
+        //   SD_MMC.remove(photos[i].filename);
+        //   Serial.printf("🗑️  Deleted: %s\n", photos[i].filename.c_str());
+        // }
+      } else {
+        Serial.println("❌ Batch upload failed - images remain on SD card");
+      }
+    } else {
+      Serial.println("❌ Server unreachable - skipping upload");
+    }
+  } else {
+    Serial.println("⚠️ WiFi not connected - 2 photos saved to SD only");
+  }
 
   Serial.println("✅ Sequence complete!\n");
 }
