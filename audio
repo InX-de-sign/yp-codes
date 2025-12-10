@@ -788,37 +788,14 @@ void setup() {
   i2s_set_pin(I2S_NUM_0, &pin_rx);
   Serial.println("✅ Microphone initialized");
 
-  i2s_config_t tx = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = (i2s_bits_per_sample_t)BITS_PER_SAMPLE,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = true,  // ✅ Important for speaker
-    .fixed_mclk = 0
-  };
-  i2s_pin_config_t pin_tx = {
-    .bck_io_num = I2S_BCLK_SPK,
-    .ws_io_num = I2S_LRC_SPK,
-    .data_out_num = I2S_DOUT_SPK,
-    .data_in_num = I2S_PIN_NO_CHANGE
-  };
-  i2s_driver_install(I2S_NUM_1, &tx, 0, NULL);
-  i2s_set_pin(I2S_NUM_1, &pin_tx);
-  Serial.println("✅ Speaker initialized");
-  
-  // Initialize MP3 decoder
-  out = new AudioOutputI2S();
+  // Initialize MP3 decoder (it will handle I2S for speaker)
+  out = new AudioOutputI2S(1, AudioOutputI2S::EXTERNAL_I2S);  // Use I2S port 1
   out->SetPinout(I2S_BCLK_SPK, I2S_LRC_SPK, I2S_DOUT_SPK);
   out->SetGain(0.5);  // 50% volume
   mp3 = new AudioGeneratorMP3();
   Serial.println("✅ MP3 decoder initialized");
   
-  play_test_tone();
+  // play_test_tone();  // Skip test tone, can't use legacy i2s_write anymore
   
   // WiFi
   WiFi.begin(ssid, password);
