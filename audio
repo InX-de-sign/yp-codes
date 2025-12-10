@@ -14,10 +14,18 @@
 #include <esp_psram.h>
 #include <ESPmDNS.h>
 #include "base64.h"
+#include "AudioFileSourceBuffer.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
 
 // Audio Stream Queue System
 #define MAX_AUDIO_STREAMS 5
-#define STREAM_BUFFER_SIZE 131072  // 128KB per stream (increased for larger MP3 files)
+#define STREAM_BUFFER_SIZE 131072  // 128KB per stream (MP3 format)
+
+// MP3 Decoder Components
+AudioGeneratorMP3 *mp3 = nullptr;
+AudioFileSourceBuffer *buff = nullptr;
+AudioOutputI2S *out = nullptr;
 
 struct AudioStream {
     uint8_t* data;
@@ -259,9 +267,65 @@ bool audio_received = false;
 String deviceId = CLIENT_ID;
 
 
-// ==================== ADD THESE NEW LINES: ====================
-#define CIRCULAR_BUFFER_SIZE 262144  // 256KB circular buffer in PSRAM
+// Custom AudioFileSource that reads from our stream buffer
+class AudioFileSourceStreamBuffer : public AudioFileSource {
+private:
+    AudioStream* stream;
+    size_t position;
+    
+public:
+    AudioFileSourceStreamBuffer(AudioStream* s) : stream(s), position(0) {}
+    
+    virtual ~AudioFileSourceStreamBuffer() override {}
+    
+    virtual uint32_t read(void *data, uint32_t len) override {
+        if (!stream || !stream->data || position >= stream->size) {
+            return 0;
+        }
+        
+        uint32_t available = stream->size - position;
+        uint32_t toRead = (len < available) ? len : available;
+        
+        memcpy(data, stream->data + position, toRead);
+        position += toRead;
+        
+        return toRead;
+    }
+    
+    virtual bool seek(int32_t pos, int dir) override {
+        if (!stream || !stream->data) return false;
+        
+        if (dir == SEEK_SET) {
+            position = pos;
+        } else if (dir == SEEK_CUR) {
+            position += pos;
+        } else if (dir == SEEK_END) {
+            position = stream->size + pos;
+        }
+        
+        if (position > stream->size) position = stream->size;
+        return true;
+    }
+    
+    virtual bool close() override {
+        position = 0;
+        return true;
+    }
+    
+    virtual bool isOpen() override {
+        return stream && stream->data && stream->size > 0;
+    }
+    
+    virtual uint32_t getSize() override {
+        return stream ? stream->size : 0;
+    }
+    
+    virtual uint32_t getPos() override {
+        return position;
+    }
+};
 
+// ==================== GLOBAL OBJECTS ====================
 AudioStreamQueue audioQueue;
 bool isPlayingAudio = false;
 unsigned long currentStreamId = 0;
@@ -626,87 +690,54 @@ void send_audio_to_server() {
 }
 
 void play_response_audio() {
-    static size_t playbackOffset = 44;  // Skip WAV header
-    static bool headerSkipped = false;
-    
     if (!audioQueue.hasStreams()) {
         if (isPlayingAudio) {
-            // All streams played
-            digitalWrite(I2S_SD_SPK, LOW);
             Serial.println("✅ All streams played!");
             isPlayingAudio = false;
-            playbackOffset = 44;
-            headerSkipped = false;
             waiting_for_response = false;
         }
         return;
     }
     
     AudioStream* current = audioQueue.getCurrentPlaybackStream();
-
-    if (!current || !current->data) {
-        Serial.println("⏳ Waiting for stream data...");
-        return;  // Exit early if stream not ready
+    if (!current || !current->data || current->size == 0) {
+        return;
     }
-
-    const size_t MIN_BUFFER_SIZE = 4096; 
-
-    // Skip header on first call for this stream
-    if (!headerSkipped) {
-        // Wait for minimum buffer before starting
-        if (current->size < MIN_BUFFER_SIZE) {
-            // Don't spam logs - only show every 10th check
-            static int bufferWaitCount = 0;
-            if (++bufferWaitCount % 10 == 0) {
-                Serial.printf("⏳ Buffering: %d/%d bytes...\n", current->size, MIN_BUFFER_SIZE);
-            }
-            return;
-        }
-        
-        Serial.printf("📊 Playing stream (size: %d bytes)\n", current->size);
-        digitalWrite(I2S_SD_SPK, HIGH);
-        playbackOffset = 44;
-        headerSkipped = true;
-    }
-
-    // Play one chunk
-    const size_t CHUNK_SIZE = 1024;
     
-    if (playbackOffset < current->size) {
-        size_t remaining = current->size - playbackOffset;
-        size_t toPlay = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+    // Start playing this stream with MP3 decoder
+    if (!isPlayingAudio) {
+        Serial.printf("🎵 Playing MP3 stream: %d bytes\n", current->size);
+        digitalWrite(I2S_SD_SPK, HIGH);
         
-        size_t written = 0;
-        i2s_write(I2S_NUM_1, current->data + playbackOffset, toPlay, &written, portMAX_DELAY);
-        playbackOffset += written;
+        // Create source from current stream
+        AudioFileSourceStreamBuffer* src = new AudioFileSourceStreamBuffer(current);
+        buff = new AudioFileSourceBuffer(src, 2048);  // 2KB buffer
         
-        // Progress every 10KB
-        if (playbackOffset % 10240 == 0) {
-            float progress = (playbackOffset * 100.0f) / current->size;
-            Serial.printf(" Playing: %.0f%% (%d/%d bytes)\n", 
-                         progress, playbackOffset, current->size);
+        if (mp3->begin(buff, out)) {
+            isPlayingAudio = true;
+        } else {
+            Serial.println("❌ MP3 decoder begin failed!");
+            delete buff;
+            delete src;
+            audioQueue.advancePlayback();
         }
-    } else {
-        // This stream is finished - but only advance if it's marked complete!
-        if (current->complete || audioQueue.getCount() > 1) {
-            // Either this stream is marked complete, OR there's another stream ready
-            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
+    }
+    
+    // Keep feeding the decoder
+    if (isPlayingAudio && mp3->isRunning()) {
+        if (!mp3->loop()) {
+            // This stream finished
+            mp3->stop();
+            delete buff;
+            Serial.println("✅ Stream complete");
             
             audioQueue.advancePlayback();
-            playbackOffset = 44;
-            headerSkipped = false;
+            isPlayingAudio = false;
             
-            // NO DELAY - immediately start next stream if available
+            // Check if more streams available
             if (!audioQueue.hasStreams()) {
                 digitalWrite(I2S_SD_SPK, LOW);
-                isPlayingAudio = false;
                 waiting_for_response = false;
-            }
-        } else {
-            static unsigned long lastWaitLog = 0;
-            if (millis() - lastWaitLog > 100) {  // Log every 100ms max
-                Serial.println("⏳ Waiting for stream completion...");
-                lastWaitLog = millis();
             }
         }
     }
@@ -779,6 +810,13 @@ void setup() {
   i2s_driver_install(I2S_NUM_1, &tx, 0, NULL);
   i2s_set_pin(I2S_NUM_1, &pin_tx);
   Serial.println("✅ Speaker initialized");
+  
+  // Initialize MP3 decoder
+  out = new AudioOutputI2S();
+  out->SetPinout(I2S_BCLK_SPK, I2S_LRC_SPK, I2S_DOUT_SPK);
+  out->SetGain(0.5);  // 50% volume
+  mp3 = new AudioGeneratorMP3();
+  Serial.println("✅ MP3 decoder initialized");
   
   play_test_tone();
   
