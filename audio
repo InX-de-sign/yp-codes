@@ -603,6 +603,7 @@ void send_audio_to_server() {
 void play_response_audio() {
     static size_t playbackOffset = 44;  // Skip WAV header
     static bool headerSkipped = false;
+    static unsigned long finishTime = 0;  // Track when playback finishes
     
     if (!audioQueue.hasStreams()) {
         if (isPlayingAudio) {
@@ -611,6 +612,7 @@ void play_response_audio() {
             isPlayingAudio = false;
             playbackOffset = 44;
             headerSkipped = false;
+            finishTime = 0;
             waiting_for_response = false;
         }
         return;
@@ -636,6 +638,7 @@ void play_response_audio() {
         digitalWrite(I2S_SD_SPK, HIGH);
         playbackOffset = 44;
         headerSkipped = true;
+        finishTime = 0;
     }
 
     const size_t CHUNK_SIZE = 1024;
@@ -647,18 +650,31 @@ void play_response_audio() {
         size_t written = 0;
         i2s_write(I2S_NUM_1, current->data + playbackOffset, toPlay, &written, portMAX_DELAY);
         playbackOffset += written;
+        
+        // Reset finish time since we're still writing
+        finishTime = 0;
     } else {
-        if (current->complete || audioQueue.getCount() > 1) {
-            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
-            
-            audioQueue.advancePlayback();
-            playbackOffset = 44;
-            headerSkipped = false;
-            
-            if (!audioQueue.hasStreams()) {
-                digitalWrite(I2S_SD_SPK, LOW);
-                isPlayingAudio = false;
-                waiting_for_response = false;
+        // All data sent - now wait for I2S buffer to drain
+        if (finishTime == 0) {
+            finishTime = millis();
+            Serial.println("⏳ Waiting for I2S buffer to drain...");
+        }
+        
+        // Wait 500ms for I2S DMA buffer to finish playing
+        if (millis() - finishTime > 500) {
+            if (current->complete || audioQueue.getCount() > 1) {
+                Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
+                
+                audioQueue.advancePlayback();
+                playbackOffset = 44;
+                headerSkipped = false;
+                finishTime = 0;
+                
+                if (!audioQueue.hasStreams()) {
+                    digitalWrite(I2S_SD_SPK, LOW);
+                    isPlayingAudio = false;
+                    waiting_for_response = false;
+                }
             }
         }
     }
