@@ -14,18 +14,10 @@
 #include <esp_psram.h>
 #include <ESPmDNS.h>
 #include "base64.h"
-#include "AudioFileSourceBuffer.h"
-#include "AudioGeneratorMP3.h"
-#include "AudioOutputI2S.h"
 
 // Audio Stream Queue System
 #define MAX_AUDIO_STREAMS 5
-#define STREAM_BUFFER_SIZE 131072  // 128KB per stream (MP3 format)
-
-// MP3 Decoder Components
-AudioGeneratorMP3 *mp3 = nullptr;
-AudioFileSourceBuffer *buff = nullptr;
-AudioOutputI2S *out = nullptr;
+#define STREAM_BUFFER_SIZE 131072  // 128KB per stream
 
 struct AudioStream {
     uint8_t* data;
@@ -266,64 +258,6 @@ bool audio_received = false;
 
 String deviceId = CLIENT_ID;
 
-
-// Custom AudioFileSource that reads from our stream buffer
-class AudioFileSourceStreamBuffer : public AudioFileSource {
-private:
-    AudioStream* stream;
-    size_t position;
-    
-public:
-    AudioFileSourceStreamBuffer(AudioStream* s) : stream(s), position(0) {}
-    
-    virtual ~AudioFileSourceStreamBuffer() override {}
-    
-    virtual uint32_t read(void *data, uint32_t len) override {
-        if (!stream || !stream->data || position >= stream->size) {
-            return 0;
-        }
-        
-        uint32_t available = stream->size - position;
-        uint32_t toRead = (len < available) ? len : available;
-        
-        memcpy(data, stream->data + position, toRead);
-        position += toRead;
-        
-        return toRead;
-    }
-    
-    virtual bool seek(int32_t pos, int dir) override {
-        if (!stream || !stream->data) return false;
-        
-        if (dir == SEEK_SET) {
-            position = pos;
-        } else if (dir == SEEK_CUR) {
-            position += pos;
-        } else if (dir == SEEK_END) {
-            position = stream->size + pos;
-        }
-        
-        if (position > stream->size) position = stream->size;
-        return true;
-    }
-    
-    virtual bool close() override {
-        position = 0;
-        return true;
-    }
-    
-    virtual bool isOpen() override {
-        return stream && stream->data && stream->size > 0;
-    }
-    
-    virtual uint32_t getSize() override {
-        return stream ? stream->size : 0;
-    }
-    
-    virtual uint32_t getPos() override {
-        return position;
-    }
-};
 
 // ==================== GLOBAL OBJECTS ====================
 AudioStreamQueue audioQueue;
@@ -667,53 +601,63 @@ void send_audio_to_server() {
 }
 
 void play_response_audio() {
+    static size_t playbackOffset = 44;  // Skip WAV header
+    static bool headerSkipped = false;
+    
     if (!audioQueue.hasStreams()) {
         if (isPlayingAudio) {
+            digitalWrite(I2S_SD_SPK, LOW);
             Serial.println("✅ All streams played!");
             isPlayingAudio = false;
+            playbackOffset = 44;
+            headerSkipped = false;
             waiting_for_response = false;
         }
         return;
     }
     
     AudioStream* current = audioQueue.getCurrentPlaybackStream();
-    if (!current || !current->data || current->size == 0) {
+    if (!current || !current->data) {
         return;
     }
-    
-    // Start playing this stream with MP3 decoder
-    if (!isPlayingAudio) {
-        Serial.printf("🎵 Playing MP3 stream: %d bytes\n", current->size);
-        digitalWrite(I2S_SD_SPK, HIGH);
-        
-        // Create source from current stream
-        AudioFileSourceStreamBuffer* src = new AudioFileSourceStreamBuffer(current);
-        buff = new AudioFileSourceBuffer(src, 2048);  // 2KB buffer
-        
-        if (mp3->begin(buff, out)) {
-            isPlayingAudio = true;
-        } else {
-            Serial.println("❌ MP3 decoder begin failed!");
-            delete buff;
-            delete src;
-            audioQueue.advancePlayback();
+
+    const size_t MIN_BUFFER_SIZE = 4096;
+
+    if (!headerSkipped) {
+        if (current->size < MIN_BUFFER_SIZE) {
+            static int bufferWaitCount = 0;
+            if (++bufferWaitCount % 10 == 0) {
+                Serial.printf("⏳ Buffering: %d/%d bytes...\n", current->size, MIN_BUFFER_SIZE);
+            }
+            return;
         }
+        
+        Serial.printf("📊 Playing WAV stream: %d bytes\n", current->size);
+        digitalWrite(I2S_SD_SPK, HIGH);
+        playbackOffset = 44;
+        headerSkipped = true;
     }
+
+    const size_t CHUNK_SIZE = 1024;
     
-    // Keep feeding the decoder
-    if (isPlayingAudio && mp3->isRunning()) {
-        if (!mp3->loop()) {
-            // This stream finished
-            mp3->stop();
-            delete buff;
-            Serial.println("✅ Stream complete");
+    if (playbackOffset < current->size) {
+        size_t remaining = current->size - playbackOffset;
+        size_t toPlay = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+        
+        size_t written = 0;
+        i2s_write(I2S_NUM_1, current->data + playbackOffset, toPlay, &written, portMAX_DELAY);
+        playbackOffset += written;
+    } else {
+        if (current->complete || audioQueue.getCount() > 1) {
+            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
             
             audioQueue.advancePlayback();
-            isPlayingAudio = false;
+            playbackOffset = 44;
+            headerSkipped = false;
             
-            // Check if more streams available
             if (!audioQueue.hasStreams()) {
                 digitalWrite(I2S_SD_SPK, LOW);
+                isPlayingAudio = false;
                 waiting_for_response = false;
             }
         }
@@ -765,14 +709,29 @@ void setup() {
   i2s_set_pin(I2S_NUM_0, &pin_rx);
   Serial.println("✅ Microphone initialized");
 
-  // Initialize MP3 decoder (it will handle I2S for speaker)
-  out = new AudioOutputI2S(1, AudioOutputI2S::EXTERNAL_I2S);  // Use I2S port 1
-  out->SetPinout(I2S_BCLK_SPK, I2S_LRC_SPK, I2S_DOUT_SPK);
-  out->SetGain(0.5);  // 50% volume
-  mp3 = new AudioGeneratorMP3();
-  Serial.println("✅ MP3 decoder initialized");
-  
-  // play_test_tone();  // Skip test tone, can't use legacy i2s_write anymore
+  // I2S Speaker (legacy driver)
+  i2s_config_t tx = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = (i2s_bits_per_sample_t)BITS_PER_SAMPLE,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+  i2s_pin_config_t pin_tx = {
+    .bck_io_num = I2S_BCLK_SPK,
+    .ws_io_num = I2S_LRC_SPK,
+    .data_out_num = I2S_DOUT_SPK,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  i2s_driver_install(I2S_NUM_1, &tx, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &pin_tx);
+  Serial.println("✅ Speaker initialized");
   
   // WiFi
   WiFi.begin(ssid, password);
