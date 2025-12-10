@@ -604,6 +604,7 @@ void play_response_audio() {
     static size_t playbackOffset = 44;  // Skip WAV header
     static bool headerSkipped = false;
     static unsigned long finishTime = 0;  // Track when playback finishes
+    static unsigned long drainDelay = 0;   // Calculated drain time
     
     if (!audioQueue.hasStreams()) {
         if (isPlayingAudio) {
@@ -613,6 +614,7 @@ void play_response_audio() {
             playbackOffset = 44;
             headerSkipped = false;
             finishTime = 0;
+            drainDelay = 0;
             waiting_for_response = false;
         }
         return;
@@ -635,6 +637,14 @@ void play_response_audio() {
         }
         
         Serial.printf("📊 Playing WAV stream: %d bytes\n", current->size);
+        
+        // Calculate drain time: (samples / sample_rate) * 1000 + buffer margin
+        // WAV data = total - 44 bytes header
+        size_t audioDataBytes = current->size - 44;
+        size_t samples = audioDataBytes / 2;  // 16-bit = 2 bytes per sample
+        drainDelay = (samples * 1000 / SAMPLE_RATE) + 200;  // Add 200ms margin
+        Serial.printf("🕐 Drain delay: %lu ms\n", drainDelay);
+        
         digitalWrite(I2S_SD_SPK, HIGH);
         playbackOffset = 44;
         headerSkipped = true;
@@ -657,11 +667,11 @@ void play_response_audio() {
         // All data sent - now wait for I2S buffer to drain
         if (finishTime == 0) {
             finishTime = millis();
-            Serial.println("⏳ Waiting for I2S buffer to drain...");
+            Serial.printf("⏳ Waiting %lu ms for I2S buffer to drain...\n", drainDelay);
         }
         
-        // Wait 500ms for I2S DMA buffer to finish playing
-        if (millis() - finishTime > 500) {
+        // Wait for calculated drain time
+        if (millis() - finishTime > drainDelay) {
             if (current->complete || audioQueue.getCount() > 1) {
                 Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
                 
@@ -669,6 +679,7 @@ void play_response_audio() {
                 playbackOffset = 44;
                 headerSkipped = false;
                 finishTime = 0;
+                drainDelay = 0;
                 
                 if (!audioQueue.hasStreams()) {
                     digitalWrite(I2S_SD_SPK, LOW);
