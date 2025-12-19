@@ -159,18 +159,6 @@ public:
         nextStreamIndex = 0;
         count = 0;
     }
-
-    // Mark a stream complete by its streamId (if found)
-    bool completeStreamById(unsigned long streamId) {
-      for (int i = 0; i < MAX_AUDIO_STREAMS; i++) {
-        if (streams[i].data && streams[i].streamId == streamId) {
-          streams[i].complete = true;
-          Serial.printf("✅ Stream %d (ID: %lu) marked complete: %u bytes\n", i, streamId, (unsigned)streams[i].size);
-          return true;
-        }
-      }
-      return false;
-    }
 };
 
 // Simple Circular Buffer for Audio Streaming
@@ -491,14 +479,17 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
               bool marked = false;
               if (completeId != 0) {
                 marked = audioQueue.completeStreamById(completeId);
+                Serial.printf("Stream ID %lu completion: %s\n", completeId, marked ? "SUCCESS" : "NOT FOUND");
               }
               if (!marked) {
                 // Fallback: mark the current write stream complete
                 audioQueue.completeCurrentStream();
+                Serial.println("⚠️ Using fallback: marked current write stream complete");
               }
 
+              // Always try to start playback when completion message received
               if (!isPlayingAudio && audioQueue.hasStreams()) {
-                Serial.println("▶️ Starting playback queue...");
+                Serial.println("▶️ Starting playback from audio_complete...");
                 isPlayingAudio = true;
               }
             }
@@ -732,9 +723,17 @@ void play_response_audio() {
         
         // Wait for calculated drain time
         if (millis() - finishTime > drainDelay) {
-          // Only advance if the stream is explicitly complete (all data received)
-          if (current->complete) {
-            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
+          // Advance if stream is marked complete, OR if we've waited too long (5 second timeout)
+          bool shouldAdvance = current->complete;
+          unsigned long waitTime = millis() - finishTime;
+          
+          if (!shouldAdvance && waitTime > 5000) {
+            Serial.printf("⚠️ Timeout after %lu ms - forcing advance (not marked complete)\n", waitTime);
+            shouldAdvance = true;
+          }
+          
+          if (shouldAdvance) {
+            Serial.printf("✅ Stream playback done: %d bytes (complete=%d)\n", playbackOffset, current->complete);
                 
             audioQueue.advancePlayback();
             playbackOffset = 44;
