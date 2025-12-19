@@ -14,10 +14,11 @@
 #include <esp_psram.h>
 #include <ESPmDNS.h>
 #include "base64.h"
+#include "WaitingMusic.hpp"
 
 // Audio Stream Queue System
 #define MAX_AUDIO_STREAMS 5
-#define STREAM_BUFFER_SIZE 2097152  // 2MB per stream (ElevenLabs high-quality audio needs more space)
+#define STREAM_BUFFER_SIZE 524288  // 512KB per stream
 
 struct AudioStream {
     uint8_t* data;
@@ -93,6 +94,21 @@ public:
         Serial.printf("✅ Stream %d complete: %d bytes\n", writeIndex, streams[writeIndex].size);
     }
     
+    bool completeStreamById(unsigned long streamId) {
+        if (count == 0) return false;
+        
+        // Find the stream with this ID and mark it complete
+        for (int i = 0; i < MAX_AUDIO_STREAMS; i++) {
+            if (streams[i].data && streams[i].streamId == streamId) {
+                streams[i].complete = true;
+                Serial.printf("✅ Stream %d (ID: %lu) marked complete: %d bytes\n", i, streamId, streams[i].size);
+                return true;
+            }
+        }
+        Serial.printf("⚠️ Stream ID %lu not found to mark complete\n", streamId);
+        return false;
+    }
+    
     AudioStream* getCurrentPlaybackStream() {
         if (count == 0) return nullptr;
         return &streams[readIndex];
@@ -142,6 +158,18 @@ public:
         writeIndex = 0;
         nextStreamIndex = 0;
         count = 0;
+    }
+
+    // Mark a stream complete by its streamId (if found)
+    bool completeStreamById(unsigned long streamId) {
+      for (int i = 0; i < MAX_AUDIO_STREAMS; i++) {
+        if (streams[i].data && streams[i].streamId == streamId) {
+          streams[i].complete = true;
+          Serial.printf("✅ Stream %d (ID: %lu) marked complete: %u bytes\n", i, streamId, (unsigned)streams[i].size);
+          return true;
+        }
+      }
+      return false;
     }
 };
 
@@ -216,16 +244,19 @@ public:
 };
 
 // ==================== WIFI CONFIGURATION ====================
-// const char* ssid = "ISDN300C";
-// const char* password = "12345678";
-const char* ssid = "ISD-Project-22Fall";
-const char* password = "isd@2022Fall";
+const char* ssid = "ISDN300C";
+const char* password = "12345678";
+//const char* ssid = "ISD-Project-22Fall";
+//const char* password = "isd@2022Fall";
 
 // ==================== SERVER CONFIGURATION (Tailscale Funnel) ====================
 const char* SERVER_HOST = "inx-fiona.tail4fb9a3.ts.net"; 
 const int SERVER_PORT = 443;
 const char* CLIENT_ID = "esp32_1"; // Unique ID for this ESP32
 String wsPath = "/ws/esp32/audio/" + String(CLIENT_ID);
+
+// Waiting music URL (16kHz, 16-bit, mono WAV)
+const char* WAIT_MUSIC_URL = "https://raw.githubusercontent.com/InX-de-sign/yp-codes/refs/heads/main/Waiting_time_16k_s16_mono.wav";
 
 // ==================== HARDWARE PINS ====================
 #define BUTTON_PIN 5
@@ -238,9 +269,9 @@ String wsPath = "/ws/esp32/audio/" + String(CLIENT_ID);
 #define I2S_SD_SPK 46
 
 // ==================== AUDIO SETTINGS ====================
-#define PLAYBACK_GAIN 8  // Reduced from 16 to prevent clipping/noise with high-quality TTS
+#define PLAYBACK_GAIN 8
 
-const int SAMPLE_RATE = 8000;  // Lowered to 8kHz to match server (smaller files, clearer audio)
+const int SAMPLE_RATE = 16000;
 const int BITS_PER_SAMPLE = 16;
 const int RECORD_DURATION_SEC = 5;
 const int AUDIO_BUFFER_SIZE = RECORD_DURATION_SEC * SAMPLE_RATE * (BITS_PER_SAMPLE / 8);
@@ -264,6 +295,7 @@ AudioStreamQueue audioQueue;
 bool isPlayingAudio = false;
 unsigned long currentStreamId = 0;
 int streamCounter = 0;
+WaitingMusic waitingMusic;
 
 // ==================== CONNECTION TEST ====================
 bool testServerConnection() {
@@ -433,25 +465,43 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           }
           else if (msgType == "audio_start" || msgType == "tts_start") {
             Serial.println("🎵 Audio incoming from server...");
-            
-            // Start a new stream
-            streamCounter++;
-            if (audioQueue.startNewStream(streamCounter)) {
-                Serial.printf("✅ Stream %d started\n", streamCounter);
+
+            // Prefer server-provided stream id (phrase) if present
+            unsigned long sid = 0;
+            if (doc.containsKey("phrase")) sid = (unsigned long)doc["phrase"].as<unsigned long>();
+            else if (doc.containsKey("stream_id")) sid = (unsigned long)doc["stream_id"].as<unsigned long>();
+            else { streamCounter++; sid = streamCounter; }
+
+            if (audioQueue.startNewStream(sid)) {
+                Serial.printf("✅ Stream started (ID: %lu)\n", sid);
             } else {
                 Serial.println("❌ Failed to start stream - queue full");
             }
+
+            // stop waiting music when server audio arrives
+            waitingMusic.stop();
+            digitalWrite(I2S_SD_SPK, LOW);
           }
-          else if (msgType == "audio_complete" || msgType == "tts_complete") {
-              if (audioQueue.getCount() > 0) {  // Only if we have streams
-                  audioQueue.completeCurrentStream();
-                  
-                  if (!isPlayingAudio && audioQueue.hasStreams()) {
-                      Serial.println("▶️ Starting playback queue...");
-                      isPlayingAudio = true;
-                  }
+            else if (msgType == "audio_complete" || msgType == "tts_complete") {
+              // Prefer a server-provided id to mark the correct stream complete
+              unsigned long completeId = 0;
+              if (doc.containsKey("phrase")) completeId = (unsigned long)doc["phrase"].as<unsigned long>();
+              else if (doc.containsKey("stream_id")) completeId = (unsigned long)doc["stream_id"].as<unsigned long>();
+
+              bool marked = false;
+              if (completeId != 0) {
+                marked = audioQueue.completeStreamById(completeId);
               }
-          }
+              if (!marked) {
+                // Fallback: mark the current write stream complete
+                audioQueue.completeCurrentStream();
+              }
+
+              if (!isPlayingAudio && audioQueue.hasStreams()) {
+                Serial.println("▶️ Starting playback queue...");
+                isPlayingAudio = true;
+              }
+            }
           else if (msgType == "error") {
             String errorMsg = doc["message"];
             Serial.println("❌ Server error: " + errorMsg);
@@ -598,11 +648,17 @@ void send_audio_to_server() {
   
   Serial.println("✅ Audio sent via Tailscale Funnel!");
   waiting_for_response = true;
+
+  // Start waiting music loop while waiting for server response
+  if (waitingMusic.isLoaded()) {
+    waitingMusic.start();
+    digitalWrite(I2S_SD_SPK, HIGH);
+  }
 }
 
 void play_response_audio() {
     static size_t playbackOffset = 44;  // Skip WAV header
-    static bool headerSkipped = false;  
+    static bool headerSkipped = false;
     static unsigned long finishTime = 0;  // Track when playback finishes
     static unsigned long drainDelay = 0;   // Calculated drain time
     
@@ -642,8 +698,8 @@ void play_response_audio() {
         // WAV data = total - 44 bytes header
         size_t audioDataBytes = current->size - 44;
         size_t samples = audioDataBytes / 2;  // 16-bit = 2 bytes per sample
-        drainDelay = (samples * 1000 / SAMPLE_RATE) + 1000;  // Add 1 second margin for I2S buffer
-        Serial.printf("🕐 Drain delay: %lu ms (audio length + buffer)\n", drainDelay);
+        drainDelay = (samples * 1000 / SAMPLE_RATE) + 2000;  // Add 2 second margin for I2S buffer
+        Serial.printf("🕐 Initial drain delay: %lu ms\n", drainDelay);
         
         digitalWrite(I2S_SD_SPK, HIGH);
         playbackOffset = 44;
@@ -664,34 +720,34 @@ void play_response_audio() {
         // Reset finish time since we're still writing
         finishTime = 0;
     } else {
-        // All data sent - now RECALCULATE drain delay based on FINAL size
+        // All data sent - now wait for I2S buffer to drain
         if (finishTime == 0) {
-            // Recalculate drain delay with final stream size
-            size_t audioDataBytes = current->size - 44;
-            size_t samples = audioDataBytes / 2;
-            drainDelay = (samples * 1000 / SAMPLE_RATE) + 1000;
-            
-            finishTime = millis();
-            Serial.printf("⏳ Recalculated drain delay for %d bytes: %lu ms\n", current->size, drainDelay);
+          // Recalculate drainDelay using the current (final) stream size
+          size_t audioDataBytesFinal = current->size - 44;
+          size_t samplesFinal = audioDataBytesFinal / 2;
+          drainDelay = (samplesFinal * 1000 / SAMPLE_RATE) + 2000;  // 2 second margin for I2S buffer
+          finishTime = millis();
+          Serial.printf("⏳ Recalculated drain: %lu ms for %d bytes\n", drainDelay, current->size);
         }
         
         // Wait for calculated drain time
         if (millis() - finishTime > drainDelay) {
-            if (current->complete || audioQueue.getCount() > 1) {
-                Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
+          // Only advance if the stream is explicitly complete (all data received)
+          if (current->complete) {
+            Serial.printf("✅ Stream complete: %d bytes played\n", playbackOffset);
                 
-                audioQueue.advancePlayback();
-                playbackOffset = 44;
-                headerSkipped = false;
-                finishTime = 0;
-                drainDelay = 0;
+            audioQueue.advancePlayback();
+            playbackOffset = 44;
+            headerSkipped = false;
+            finishTime = 0;
+            drainDelay = 0;
                 
-                if (!audioQueue.hasStreams()) {
-                    digitalWrite(I2S_SD_SPK, LOW);
-                    isPlayingAudio = false;
-                    waiting_for_response = false;
-                }
+            if (!audioQueue.hasStreams()) {
+              digitalWrite(I2S_SD_SPK, LOW);
+              isPlayingAudio = false;
+              waiting_for_response = false;
             }
+          }
         }
     }
 }
@@ -798,6 +854,14 @@ void setup() {
   server.on("/download", handleDownload);
   server.begin();
   Serial.println("✅ Web server running!");
+
+  // Download waiting music into PSRAM
+  Serial.println("📥 Downloading waiting music...");
+  if (waitingMusic.begin(WAIT_MUSIC_URL)) {
+    Serial.println("✅ Waiting music loaded into PSRAM");
+  } else {
+    Serial.println("⚠️ Waiting music load failed");
+  }
   
   Serial.println("\n========================================");
   Serial.println("✅ SYSTEM READY");
@@ -832,10 +896,13 @@ void loop() {
       size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
       Serial.printf("Free PSRAM: %d bytes\n", free_psram);
       
-      if (free_psram < 200000) {
+      if (free_psram < 1200000) {
         Serial.println("⚠️ Low memory! Skipping...");
         return;
       }
+      // ensure waiting music is stopped before recording
+      waitingMusic.stop();
+      digitalWrite(I2S_SD_SPK, LOW);
 
       record_audio();
       send_audio_to_server();
@@ -847,9 +914,12 @@ void loop() {
         
         audioQueue.clear();  // Clear all queued streams
         isPlayingAudio = false;
-        
+        // stop waiting music and start new recording
+        waitingMusic.stop();
+        digitalWrite(I2S_SD_SPK, LOW);
+
         Serial.println("Starting new recording...\n");
-        
+
         record_audio();
         send_audio_to_server();
         Serial.println("Waiting for server response...");
@@ -860,6 +930,11 @@ void loop() {
   
   if (isPlayingAudio) {
     play_response_audio();
+  }
+
+  // If waiting for server response and not playing server audio, loop waiting music
+  if (waiting_for_response && !isPlayingAudio) {
+    waitingMusic.loop();
   }
 
   yield();
